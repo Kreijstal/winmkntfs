@@ -1,0 +1,1224 @@
+/*
+ * winmkntfs - Portable NTFS formatter
+ * Core formatting logic, ported from ntfs-3g mkntfs.
+ *
+ * Copyright (C) 2000-2007 Anton Altaparmakov
+ * Copyright (C) 2025 winmkntfs contributors
+ * License: GPL-2.0-or-later
+ *
+ * Creates NTFS 3.1 volumes with these system files:
+ *   $MFT, $MFTMirr, $LogFile, $Volume, $AttrDef,
+ *   . (root), $Bitmap, $Boot, $BadClus, $Secure, $UpCase, $Extend
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include "mkntfs.h"
+
+/* Forward declarations for embedded data */
+extern const ATTR_DEF *get_attrdef_table(ULONG *count);
+extern void ntfs_upcase_table_build(WCHAR *uc, ULONG uc_len);
+
+/* ============================================================
+ * Internal state
+ * ============================================================ */
+
+typedef struct _MKNTFS_STATE {
+    const MKNTFS_IO *io;
+
+    /* Volume geometry */
+    ULONG sector_size;
+    ULONG cluster_size;
+    ULONG sectors_per_cluster;
+    ULONGLONG total_sectors;
+    ULONGLONG total_clusters;
+    ULONG mft_record_size;
+    ULONG index_record_size;
+
+    /* MFT layout */
+    ULONGLONG mft_lcn;          /* First cluster of $MFT */
+    ULONGLONG mft_mirr_lcn;     /* First cluster of $MFTMirr */
+    ULONG mft_records;          /* Number of MFT records to create (at least 16+11 for reserve) */
+    ULONGLONG mft_size;         /* $MFT byte size */
+    ULONGLONG mft_clusters;     /* $MFT cluster count */
+
+    /* $LogFile */
+    ULONGLONG logfile_lcn;
+    ULONGLONG logfile_size;
+    ULONGLONG logfile_clusters;
+
+    /* Bitmaps */
+    UCHAR *lcn_bitmap;          /* Cluster allocation bitmap */
+    ULONG lcn_bitmap_size;      /* In bytes */
+    UCHAR *mft_bitmap;          /* MFT record allocation bitmap */
+    ULONG mft_bitmap_size;
+
+    /* MFT buffer */
+    UCHAR *mft_buf;             /* All MFT records */
+
+    /* $AttrDef */
+    ULONGLONG attrdef_lcn;
+    ULONGLONG attrdef_clusters;
+
+    /* Upcase table */
+    WCHAR *upcase;
+    ULONG upcase_len;           /* In WCHARs (65536) */
+
+    /* Volume info */
+    const WCHAR *label;
+    ULONGLONG serial_number;
+
+    /* Attribute instance counter per record */
+    USHORT next_instance;
+
+} MKNTFS_STATE;
+
+/* ============================================================
+ * Helpers
+ * ============================================================ */
+
+static ULONGLONG mkntfs_time(void)
+{
+    /* NTFS epoch: 1601-01-01, time_t epoch: 1970-01-01
+       Difference: 11644473600 seconds
+       NTFS unit: 100ns intervals */
+    time_t t = time(NULL);
+    return ((ULONGLONG)t + 11644473600ULL) * 10000000ULL;
+}
+
+static int io_write(const MKNTFS_STATE *s, ULONGLONG offset, const void *buf, ULONG len)
+{
+    return s->io->write(s->io->context, offset, buf, len);
+}
+
+/* Set bits [start, start+count) in bitmap */
+static void bitmap_set(UCHAR *bmp, ULONGLONG start, ULONGLONG count)
+{
+    ULONGLONG i;
+    for (i = 0; i < count; i++) {
+        ULONGLONG bit = start + i;
+        bmp[bit >> 3] |= (1 << (bit & 7));
+    }
+}
+
+/* Auto-select cluster size based on volume size */
+static ULONG auto_cluster_size(ULONGLONG total_bytes)
+{
+    /* Windows defaults - NTFS typically uses 4096 for most volumes */
+    (void)total_bytes;
+    return 4096;
+}
+
+/* Encode signed ClustersPerMftRecord / ClustersPerIndexRecord
+   If size is a power-of-2 smaller than cluster_size, encode as -log2(size) */
+static CHAR encode_clusters_per_record(ULONG record_size, ULONG cluster_size)
+{
+    if (record_size >= cluster_size) {
+        return (CHAR)(record_size / cluster_size);
+    }
+    /* Negative exponent: record_size = 2^|n| */
+    int n = 0;
+    ULONG v = record_size;
+    while (v > 1) { v >>= 1; n++; }
+    return (CHAR)(-n);
+}
+
+/* ============================================================
+ * Data run encoding
+ * ============================================================ */
+
+/* Count bytes needed to encode a signed value */
+static int runlen_bytes(LONGLONG val)
+{
+    int n;
+    if (val == 0) return 0;
+    if (val > 0) {
+        for (n = 1; n <= 8; n++) {
+            if (val < (1LL << (n * 8 - 1))) return n;
+        }
+    } else {
+        for (n = 1; n <= 8; n++) {
+            if (val >= -(1LL << (n * 8 - 1))) return n;
+        }
+    }
+    return 8;
+}
+
+static int runlen_bytes_unsigned(ULONGLONG val)
+{
+    int n;
+    if (val == 0) return 1; /* length field must be at least 1 byte */
+    for (n = 1; n <= 8; n++) {
+        if (val < (1ULL << (n * 8))) return n;
+    }
+    return 8;
+}
+
+/* Encode a single data run: (length, lcn_offset) relative to previous LCN.
+   Returns bytes written. */
+static int encode_run(UCHAR *dst, ULONGLONG length, LONGLONG lcn_offset)
+{
+    int len_bytes = runlen_bytes_unsigned(length);
+    int off_bytes = runlen_bytes(lcn_offset);
+    int i;
+
+    dst[0] = (UCHAR)((off_bytes << 4) | len_bytes);
+    for (i = 0; i < len_bytes; i++)
+        dst[1 + i] = (UCHAR)(length >> (i * 8));
+    for (i = 0; i < off_bytes; i++)
+        dst[1 + len_bytes + i] = (UCHAR)(lcn_offset >> (i * 8));
+    return 1 + len_bytes + off_bytes;
+}
+
+/* ============================================================
+ * Update Sequence Array (fixup) support
+ * ============================================================ */
+
+/* Apply fixup: set the USN and store original last-2-bytes of each sector */
+static void apply_fixup(void *record, ULONG record_size, ULONG sector_size)
+{
+    FILE_RECORD_HEADER *hdr = (FILE_RECORD_HEADER *)record;
+    USHORT *usa;
+    ULONG i, num_sectors;
+    USHORT usn;
+
+    num_sectors = record_size / sector_size;
+    usa = (USHORT *)((UCHAR *)record + hdr->UpdateSeqOffset);
+    usn = *usa;  /* USN value */
+
+    /* For each sector, save the last 2 bytes and replace with USN */
+    for (i = 0; i < num_sectors; i++) {
+        USHORT *sector_end = (USHORT *)((UCHAR *)record + (i + 1) * sector_size - 2);
+        usa[1 + i] = *sector_end;   /* Save original */
+        *sector_end = usn;           /* Replace with USN */
+    }
+}
+
+/* ============================================================
+ * Attribute builders
+ * ============================================================ */
+
+/* Initialize a file record header */
+static void init_file_record(FILE_RECORD_HEADER *rec, ULONG rec_size, ULONG sector_size,
+                              USHORT seq_num, USHORT flags, ULONG mft_num)
+{
+    ULONG usa_offset, usa_size;
+
+    memset(rec, 0, rec_size);
+    rec->Magic = NRH_FILE_TYPE;
+
+    /* Update sequence: right after the header */
+    usa_offset = sizeof(FILE_RECORD_HEADER);
+    usa_size = 1 + (rec_size / sector_size);  /* 1 USN + N array entries */
+    rec->UpdateSeqOffset = (USHORT)usa_offset;
+    rec->UpdateSeqSize = (USHORT)usa_size;
+
+    /* Set USN to 1 */
+    USHORT *usa = (USHORT *)((UCHAR *)rec + usa_offset);
+    usa[0] = 1;  /* USN value */
+
+    rec->SequenceNumber = seq_num;
+    rec->LinkCount = 0;
+    rec->AttributeOffset = (USHORT)ALIGN_UP(usa_offset + usa_size * 2, 8);
+    rec->Flags = flags;
+    rec->BytesAllocated = rec_size;
+    rec->MftRecordNumber = mft_num;
+    rec->NextAttributeId = 0;
+}
+
+/* Get pointer to where the next attribute should be written */
+static UCHAR *get_attr_pos(FILE_RECORD_HEADER *rec)
+{
+    UCHAR *base = (UCHAR *)rec;
+    UCHAR *pos = base + rec->AttributeOffset;
+
+    /* Walk existing attributes to find the end */
+    while (pos < base + rec->BytesAllocated - 8) {
+        ATTR_RECORD *a = (ATTR_RECORD *)pos;
+        if (a->Type == AT_END || a->Type == 0 || a->Length == 0)
+            break;
+        pos += a->Length;
+    }
+    return pos;
+}
+
+/* Add a resident attribute. Returns pointer past the new attribute. */
+static UCHAR *add_resident_attr(MKNTFS_STATE *s, FILE_RECORD_HEADER *rec,
+                                 ULONG type, const WCHAR *name, ULONG name_len,
+                                 const void *value, ULONG value_len,
+                                 UCHAR resident_flags)
+{
+    UCHAR *pos = get_attr_pos(rec);
+    ATTR_RECORD *a = (ATTR_RECORD *)pos;
+    ULONG hdr_size = sizeof(ATTR_RECORD);  /* We'll use the resident part */
+    ULONG name_off, value_off, total_len;
+
+    memset(a, 0, hdr_size);
+    a->Type = type;
+    a->NonResident = 0;
+    a->NameLength = (UCHAR)name_len;
+    a->Flags = 0;
+    a->Instance = s->next_instance++;
+
+    /* Name goes right after the fixed header (offset 0x18 for resident) */
+    name_off = 0x18;
+    if (name_len > 0) {
+        a->NameOffset = (USHORT)name_off;
+        memcpy(pos + name_off, name, name_len * sizeof(WCHAR));
+        value_off = ALIGN_UP(name_off + name_len * sizeof(WCHAR), 4);
+    } else {
+        a->NameOffset = (USHORT)name_off;
+        value_off = name_off;
+    }
+
+    a->Resident.ValueOffset = (USHORT)value_off;
+    a->Resident.ValueLength = value_len;
+    a->Resident.ResidentFlags = resident_flags;
+
+    if (value && value_len > 0)
+        memcpy(pos + value_off, value, value_len);
+
+    total_len = ALIGN_UP(value_off + value_len, 8);
+    a->Length = total_len;
+
+    /* Write AT_END marker after this attribute */
+    ULONG *end = (ULONG *)(pos + total_len);
+    *end = AT_END;
+
+    rec->BytesInUse = (ULONG)(pos + total_len + 8 - (UCHAR *)rec); /* +8 for AT_END + padding */
+    return pos + total_len;
+}
+
+/* Add a non-resident attribute with a simple single-run mapping. */
+static UCHAR *add_nonresident_attr(MKNTFS_STATE *s, FILE_RECORD_HEADER *rec,
+                                    ULONG type, const WCHAR *name, ULONG name_len,
+                                    ULONGLONG start_lcn, ULONGLONG num_clusters,
+                                    ULONGLONG data_size, ULONGLONG initialized_size)
+{
+    UCHAR *pos = get_attr_pos(rec);
+    ATTR_RECORD *a = (ATTR_RECORD *)pos;
+    ULONG name_off, runs_off, total_len;
+    UCHAR run_buf[16];
+    int run_len;
+
+    memset(a, 0, 0x48); /* Non-resident header is 0x40, pad to 0x48 */
+    a->Type = type;
+    a->NonResident = 1;
+    a->NameLength = (UCHAR)name_len;
+    a->Flags = 0;
+    a->Instance = s->next_instance++;
+
+    /* Name offset: right after the fixed non-resident header (0x40) */
+    name_off = 0x40;
+    if (name_len > 0) {
+        a->NameOffset = (USHORT)name_off;
+        memcpy(pos + name_off, name, name_len * sizeof(WCHAR));
+        runs_off = ALIGN_UP(name_off + name_len * sizeof(WCHAR), 4);
+    } else {
+        a->NameOffset = (USHORT)name_off;
+        runs_off = name_off;
+    }
+
+    a->NR.LowestVcn = 0;
+    a->NR.HighestVcn = num_clusters - 1;
+    a->NR.MappingPairsOffset = (USHORT)runs_off;
+    a->NR.AllocatedSize = (LONGLONG)(num_clusters * s->cluster_size);
+    a->NR.DataSize = (LONGLONG)data_size;
+    a->NR.InitializedSize = (LONGLONG)initialized_size;
+
+    /* Encode single data run */
+    run_len = encode_run(run_buf, num_clusters, (LONGLONG)start_lcn);
+    memcpy(pos + runs_off, run_buf, run_len);
+    pos[runs_off + run_len] = 0; /* Terminator */
+
+    total_len = ALIGN_UP(runs_off + run_len + 1, 8);
+    a->Length = total_len;
+
+    /* AT_END marker */
+    ULONG *end = (ULONG *)(pos + total_len);
+    *end = AT_END;
+
+    rec->BytesInUse = (ULONG)(pos + total_len + 8 - (UCHAR *)rec);
+    return pos + total_len;
+}
+
+/* ============================================================
+ * System file record builders
+ * ============================================================ */
+
+static void make_file_name(FILE_NAME_ATTR *fn, ULONGLONG parent_mft_ref,
+                            const WCHAR *name, UCHAR name_len,
+                            ULONG file_attrs, ULONGLONG alloc_size,
+                            ULONGLONG data_size, ULONGLONG time_val)
+{
+    /* Parent ref: MFT number in low 48 bits, seq in high 16 */
+    fn->ParentDirectory = parent_mft_ref | ((ULONGLONG)1 << 48); /* seq 1 */
+    fn->CreationTime = time_val;
+    fn->ModificationTime = time_val;
+    fn->MftModificationTime = time_val;
+    fn->AccessTime = time_val;
+    fn->AllocatedSize = alloc_size;
+    fn->DataSize = data_size;
+    fn->FileAttributes = file_attrs;
+    fn->Extended.EaInfo.PackedEaSize = 0;
+    fn->Extended.EaInfo.Reserved = 0;
+    fn->FileNameLength = name_len;
+    fn->FileNameType = FILE_NAME_WIN32_AND_DOS;
+    memcpy(fn->FileName, name, name_len * sizeof(WCHAR));
+}
+
+/* MFT reference: record number | (seq << 48) */
+static ULONGLONG mft_ref(ULONG record, USHORT seq)
+{
+    return (ULONGLONG)record | ((ULONGLONG)seq << 48);
+}
+
+/* Build $MFT (record 0) */
+static void build_mft(MKNTFS_STATE *s)
+{
+    FILE_RECORD_HEADER *rec = (FILE_RECORD_HEADER *)(s->mft_buf + 0 * s->mft_record_size);
+    ULONGLONG now = mkntfs_time();
+    STANDARD_INFORMATION si;
+    UCHAR fn_buf[sizeof(FILE_NAME_ATTR) + 4 * sizeof(WCHAR)];
+    FILE_NAME_ATTR *fn = (FILE_NAME_ATTR *)fn_buf;
+
+    s->next_instance = 0;
+    init_file_record(rec, s->mft_record_size, s->sector_size, 1, FRH_IN_USE, FILE_MFT);
+    rec->LinkCount = 1;
+
+    /* $STANDARD_INFORMATION */
+    memset(&si, 0, sizeof(si));
+    si.CreationTime = si.ModificationTime = si.MftModificationTime = si.AccessTime = now;
+    si.FileAttributes = FILE_ATTR_HIDDEN | FILE_ATTR_SYSTEM;
+    add_resident_attr(s, rec, AT_STANDARD_INFORMATION, NULL, 0, &si, 72, 0);
+
+    /* $FILE_NAME */
+    memset(fn_buf, 0, sizeof(fn_buf));
+    WCHAR mft_name[] = { '$', 'M', 'F', 'T' };
+    make_file_name(fn, FILE_Root, mft_name, 4,
+                   FILE_ATTR_HIDDEN | FILE_ATTR_SYSTEM,
+                   s->mft_size, s->mft_size, now);
+    add_resident_attr(s, rec, AT_FILE_NAME, NULL, 0, fn_buf,
+                      sizeof(FILE_NAME_ATTR) - sizeof(WCHAR) + 4 * sizeof(WCHAR), 0);
+
+    /* $DATA (non-resident) - the MFT data itself */
+    add_nonresident_attr(s, rec, AT_DATA, NULL, 0,
+                         s->mft_lcn, s->mft_clusters,
+                         s->mft_size, s->mft_size);
+
+    /* $BITMAP (resident - MFT bitmap) */
+    add_resident_attr(s, rec, AT_BITMAP, NULL, 0,
+                      s->mft_bitmap, s->mft_bitmap_size, 0);
+}
+
+/* Build $MFTMirr (record 1) */
+static void build_mftmirr(MKNTFS_STATE *s)
+{
+    FILE_RECORD_HEADER *rec = (FILE_RECORD_HEADER *)(s->mft_buf + 1 * s->mft_record_size);
+    ULONGLONG now = mkntfs_time();
+    STANDARD_INFORMATION si;
+    UCHAR fn_buf[sizeof(FILE_NAME_ATTR) + 8 * sizeof(WCHAR)];
+    FILE_NAME_ATTR *fn = (FILE_NAME_ATTR *)fn_buf;
+    ULONGLONG mirr_size = 4 * s->mft_record_size; /* First 4 records */
+    ULONGLONG mirr_clusters = (mirr_size + s->cluster_size - 1) / s->cluster_size;
+
+    s->next_instance = 0;
+    init_file_record(rec, s->mft_record_size, s->sector_size, 1, FRH_IN_USE, FILE_MFTMirr);
+    rec->LinkCount = 1;
+
+    memset(&si, 0, sizeof(si));
+    si.CreationTime = si.ModificationTime = si.MftModificationTime = si.AccessTime = now;
+    si.FileAttributes = FILE_ATTR_HIDDEN | FILE_ATTR_SYSTEM;
+    add_resident_attr(s, rec, AT_STANDARD_INFORMATION, NULL, 0, &si, 72, 0);
+
+    memset(fn_buf, 0, sizeof(fn_buf));
+    WCHAR name[] = { '$', 'M', 'F', 'T', 'M', 'i', 'r', 'r' };
+    make_file_name(fn, FILE_Root, name, 8,
+                   FILE_ATTR_HIDDEN | FILE_ATTR_SYSTEM,
+                   mirr_size, mirr_size, now);
+    add_resident_attr(s, rec, AT_FILE_NAME, NULL, 0, fn_buf,
+                      sizeof(FILE_NAME_ATTR) - sizeof(WCHAR) + 8 * sizeof(WCHAR), 0);
+
+    add_nonresident_attr(s, rec, AT_DATA, NULL, 0,
+                         s->mft_mirr_lcn, mirr_clusters,
+                         mirr_size, mirr_size);
+}
+
+/* Build $LogFile (record 2) */
+static void build_logfile(MKNTFS_STATE *s)
+{
+    FILE_RECORD_HEADER *rec = (FILE_RECORD_HEADER *)(s->mft_buf + 2 * s->mft_record_size);
+    ULONGLONG now = mkntfs_time();
+    STANDARD_INFORMATION si;
+    UCHAR fn_buf[sizeof(FILE_NAME_ATTR) + 8 * sizeof(WCHAR)];
+    FILE_NAME_ATTR *fn = (FILE_NAME_ATTR *)fn_buf;
+
+    s->next_instance = 0;
+    init_file_record(rec, s->mft_record_size, s->sector_size, 1, FRH_IN_USE, FILE_LogFile);
+    rec->LinkCount = 1;
+
+    memset(&si, 0, sizeof(si));
+    si.CreationTime = si.ModificationTime = si.MftModificationTime = si.AccessTime = now;
+    si.FileAttributes = FILE_ATTR_HIDDEN | FILE_ATTR_SYSTEM;
+    add_resident_attr(s, rec, AT_STANDARD_INFORMATION, NULL, 0, &si, 72, 0);
+
+    memset(fn_buf, 0, sizeof(fn_buf));
+    WCHAR name[] = { '$', 'L', 'o', 'g', 'F', 'i', 'l', 'e' };
+    make_file_name(fn, FILE_Root, name, 8,
+                   FILE_ATTR_HIDDEN | FILE_ATTR_SYSTEM,
+                   s->logfile_size, s->logfile_size, now);
+    add_resident_attr(s, rec, AT_FILE_NAME, NULL, 0, fn_buf,
+                      sizeof(FILE_NAME_ATTR) - sizeof(WCHAR) + 8 * sizeof(WCHAR), 0);
+
+    add_nonresident_attr(s, rec, AT_DATA, NULL, 0,
+                         s->logfile_lcn, s->logfile_clusters,
+                         s->logfile_size, s->logfile_size);
+}
+
+/* Build $Volume (record 3) */
+static void build_volume(MKNTFS_STATE *s)
+{
+    FILE_RECORD_HEADER *rec = (FILE_RECORD_HEADER *)(s->mft_buf + 3 * s->mft_record_size);
+    ULONGLONG now = mkntfs_time();
+    STANDARD_INFORMATION si;
+    UCHAR fn_buf[sizeof(FILE_NAME_ATTR) + 8 * sizeof(WCHAR)];
+    FILE_NAME_ATTR *fn = (FILE_NAME_ATTR *)fn_buf;
+    VOLUME_INFORMATION vi;
+
+    s->next_instance = 0;
+    init_file_record(rec, s->mft_record_size, s->sector_size, 1, FRH_IN_USE, FILE_Volume);
+    rec->LinkCount = 1;
+
+    memset(&si, 0, sizeof(si));
+    si.CreationTime = si.ModificationTime = si.MftModificationTime = si.AccessTime = now;
+    si.FileAttributes = FILE_ATTR_HIDDEN | FILE_ATTR_SYSTEM;
+    add_resident_attr(s, rec, AT_STANDARD_INFORMATION, NULL, 0, &si, 72, 0);
+
+    memset(fn_buf, 0, sizeof(fn_buf));
+    WCHAR name[] = { '$', 'V', 'o', 'l', 'u', 'm', 'e' };
+    make_file_name(fn, FILE_Root, name, 7,
+                   FILE_ATTR_HIDDEN | FILE_ATTR_SYSTEM, 0, 0, now);
+    add_resident_attr(s, rec, AT_FILE_NAME, NULL, 0, fn_buf,
+                      sizeof(FILE_NAME_ATTR) - sizeof(WCHAR) + 7 * sizeof(WCHAR), 0);
+
+    /* $VOLUME_NAME */
+    if (s->label) {
+        ULONG label_len = 0;
+        while (s->label[label_len]) label_len++;
+        add_resident_attr(s, rec, AT_VOLUME_NAME, NULL, 0,
+                          s->label, label_len * sizeof(WCHAR), 0);
+    }
+
+    /* $VOLUME_INFORMATION: NTFS 3.1 */
+    memset(&vi, 0, sizeof(vi));
+    vi.MajorVersion = 3;
+    vi.MinorVersion = 1;
+    add_resident_attr(s, rec, AT_VOLUME_INFORMATION, NULL, 0, &vi, sizeof(vi), 0);
+}
+
+/* Build $AttrDef (record 4) */
+static void build_attrdef(MKNTFS_STATE *s)
+{
+    FILE_RECORD_HEADER *rec = (FILE_RECORD_HEADER *)(s->mft_buf + 4 * s->mft_record_size);
+    ULONGLONG now = mkntfs_time();
+    STANDARD_INFORMATION si;
+    UCHAR fn_buf[sizeof(FILE_NAME_ATTR) + 8 * sizeof(WCHAR)];
+    FILE_NAME_ATTR *fn = (FILE_NAME_ATTR *)fn_buf;
+
+    s->next_instance = 0;
+    init_file_record(rec, s->mft_record_size, s->sector_size, 1, FRH_IN_USE, FILE_AttrDef);
+    rec->LinkCount = 1;
+
+    memset(&si, 0, sizeof(si));
+    si.CreationTime = si.ModificationTime = si.MftModificationTime = si.AccessTime = now;
+    si.FileAttributes = FILE_ATTR_HIDDEN | FILE_ATTR_SYSTEM;
+    add_resident_attr(s, rec, AT_STANDARD_INFORMATION, NULL, 0, &si, 72, 0);
+
+    memset(fn_buf, 0, sizeof(fn_buf));
+    WCHAR name[] = { '$', 'A', 't', 't', 'r', 'D', 'e', 'f' };
+    ULONG attrdef_count;
+    const ATTR_DEF *attrdef_table = get_attrdef_table(&attrdef_count);
+    ULONG attrdef_bytes = attrdef_count * sizeof(ATTR_DEF);
+    make_file_name(fn, FILE_Root, name, 8,
+                   FILE_ATTR_HIDDEN | FILE_ATTR_SYSTEM,
+                   attrdef_bytes, attrdef_bytes, now);
+    add_resident_attr(s, rec, AT_FILE_NAME, NULL, 0, fn_buf,
+                      sizeof(FILE_NAME_ATTR) - sizeof(WCHAR) + 8 * sizeof(WCHAR), 0);
+
+    /* $DATA - non-resident (too large for 1024-byte MFT record) */
+    s->attrdef_clusters = (attrdef_bytes + s->cluster_size - 1) / s->cluster_size;
+    add_nonresident_attr(s, rec, AT_DATA, NULL, 0,
+                         s->attrdef_lcn, s->attrdef_clusters,
+                         attrdef_bytes, attrdef_bytes);
+    bitmap_set(s->lcn_bitmap, s->attrdef_lcn, s->attrdef_clusters);
+}
+
+/* Helper: create an index entry for a system file in root directory */
+static ULONG make_index_entry(UCHAR *buf, ULONG mft_num, USHORT seq,
+                               const WCHAR *name, UCHAR name_len,
+                               ULONG file_attrs, ULONGLONG time_val)
+{
+    INDEX_ENTRY *ie = (INDEX_ENTRY *)buf;
+    FILE_NAME_ATTR *fn;
+    ULONG fn_size = sizeof(FILE_NAME_ATTR) - sizeof(WCHAR) + name_len * sizeof(WCHAR);
+    ULONG entry_size = ALIGN_UP(sizeof(INDEX_ENTRY) + fn_size, 8);
+
+    memset(buf, 0, entry_size);
+    ie->Data.Directory.IndexedFile = mft_ref(mft_num, seq);
+    ie->Length = (USHORT)entry_size;
+    ie->KeyLength = (USHORT)fn_size;
+    ie->Flags = 0;
+
+    fn = (FILE_NAME_ATTR *)(buf + sizeof(INDEX_ENTRY));
+    fn->ParentDirectory = mft_ref(FILE_Root, 1);
+    fn->CreationTime = time_val;
+    fn->ModificationTime = time_val;
+    fn->MftModificationTime = time_val;
+    fn->AccessTime = time_val;
+    fn->FileAttributes = file_attrs;
+    fn->FileNameLength = name_len;
+    fn->FileNameType = FILE_NAME_WIN32_AND_DOS;
+    memcpy(fn->FileName, name, name_len * sizeof(WCHAR));
+
+    return entry_size;
+}
+
+/* Build root directory (record 5) */
+static void build_root(MKNTFS_STATE *s)
+{
+    FILE_RECORD_HEADER *rec = (FILE_RECORD_HEADER *)(s->mft_buf + 5 * s->mft_record_size);
+    ULONGLONG now = mkntfs_time();
+    STANDARD_INFORMATION si;
+    UCHAR fn_buf[sizeof(FILE_NAME_ATTR) + 2 * sizeof(WCHAR)];
+    FILE_NAME_ATTR *fn = (FILE_NAME_ATTR *)fn_buf;
+
+    s->next_instance = 0;
+    init_file_record(rec, s->mft_record_size, s->sector_size, 1,
+                     FRH_IN_USE | FRH_DIRECTORY, FILE_Root);
+    rec->LinkCount = 1;
+
+    memset(&si, 0, sizeof(si));
+    si.CreationTime = si.ModificationTime = si.MftModificationTime = si.AccessTime = now;
+    si.FileAttributes = FILE_ATTR_HIDDEN | FILE_ATTR_SYSTEM | FILE_ATTR_DUP_FILE_NAME_INDEX_PRESENT;
+    add_resident_attr(s, rec, AT_STANDARD_INFORMATION, NULL, 0, &si, 72, 0);
+
+    /* Root's own $FILE_NAME: name is "." and parent is self */
+    memset(fn_buf, 0, sizeof(fn_buf));
+    WCHAR dot = '.';
+    make_file_name(fn, FILE_Root, &dot, 1,
+                   FILE_ATTR_HIDDEN | FILE_ATTR_SYSTEM | FILE_ATTR_DUP_FILE_NAME_INDEX_PRESENT,
+                   0, 0, now);
+    add_resident_attr(s, rec, AT_FILE_NAME, NULL, 0, fn_buf,
+                      sizeof(FILE_NAME_ATTR) - sizeof(WCHAR) + 1 * sizeof(WCHAR), 0);
+
+    /* $INDEX_ROOT for $I30 with system file entries */
+    /* Build index entries for system files */
+    /* Entries sorted by NTFS uppercase collation ($=0x24 < .=0x2E) */
+    struct { ULONG mft_num; const WCHAR *name; UCHAR len; ULONG attrs; } sysfiles[] = {
+        { FILE_Extend,  (WCHAR[]){ '$','E','x','t','e','n','d' }, 7, FILE_ATTR_HIDDEN|FILE_ATTR_SYSTEM|FILE_ATTR_DUP_FILE_NAME_INDEX_PRESENT },
+        { FILE_Secure,  (WCHAR[]){ '$','S','e','c','u','r','e' }, 7, FILE_ATTR_HIDDEN|FILE_ATTR_SYSTEM },
+        { FILE_UpCase,  (WCHAR[]){ '$','U','p','C','a','s','e' }, 7, FILE_ATTR_HIDDEN|FILE_ATTR_SYSTEM },
+        { FILE_Root,    (WCHAR[]){ '.' }, 1, FILE_ATTR_HIDDEN|FILE_ATTR_SYSTEM|FILE_ATTR_DUP_FILE_NAME_INDEX_PRESENT },
+    };
+    int num_sysfiles = sizeof(sysfiles) / sizeof(sysfiles[0]);
+
+    /* Calculate total index size */
+    UCHAR entries_buf[4096]; /* Should be enough for all entries */
+    ULONG entries_size = 0;
+    int i;
+    for (i = 0; i < num_sysfiles; i++) {
+        entries_size += make_index_entry(entries_buf + entries_size,
+                                         sysfiles[i].mft_num, 1,
+                                         sysfiles[i].name, sysfiles[i].len,
+                                         sysfiles[i].attrs, now);
+    }
+    /* End entry */
+    INDEX_ENTRY *end = (INDEX_ENTRY *)(entries_buf + entries_size);
+    memset(end, 0, sizeof(INDEX_ENTRY));
+    end->Length = sizeof(INDEX_ENTRY);
+    end->Flags = INDEX_ENTRY_END;
+    entries_size += sizeof(INDEX_ENTRY);
+
+    /* Build INDEX_ROOT */
+    UCHAR idx_buf[sizeof(INDEX_ROOT) + 4096];
+    INDEX_ROOT *ir = (INDEX_ROOT *)idx_buf;
+
+    memset(idx_buf, 0, sizeof(INDEX_ROOT));
+    ir->AttributeType = AT_FILE_NAME;
+    ir->CollationRule = 1; /* COLLATION_FILE_NAME */
+    ir->IndexBlockSize = s->index_record_size;
+    ir->ClustersPerIndexBlock = (UCHAR)(s->index_record_size / s->cluster_size);
+    if (ir->ClustersPerIndexBlock == 0) ir->ClustersPerIndexBlock = 1;
+
+    ir->Header.EntriesOffset = sizeof(INDEX_HEADER);
+    ir->Header.IndexLength = sizeof(INDEX_HEADER) + entries_size;
+    ir->Header.AllocatedSize = sizeof(INDEX_HEADER) + entries_size;
+    ir->Header.Flags = 0; /* Small index */
+
+    memcpy(idx_buf + sizeof(INDEX_ROOT), entries_buf, entries_size);
+
+    WCHAR i30_name[] = { '$', 'I', '3', '0' };
+    add_resident_attr(s, rec, AT_INDEX_ROOT, i30_name, 4,
+                      idx_buf, sizeof(INDEX_ROOT) + entries_size, 0);
+}
+
+/* Build $Bitmap (record 6) */
+static void build_bitmap(MKNTFS_STATE *s)
+{
+    FILE_RECORD_HEADER *rec = (FILE_RECORD_HEADER *)(s->mft_buf + 6 * s->mft_record_size);
+    ULONGLONG now = mkntfs_time();
+    STANDARD_INFORMATION si;
+    UCHAR fn_buf[sizeof(FILE_NAME_ATTR) + 8 * sizeof(WCHAR)];
+    FILE_NAME_ATTR *fn = (FILE_NAME_ATTR *)fn_buf;
+    ULONGLONG bitmap_clusters = (s->lcn_bitmap_size + s->cluster_size - 1) / s->cluster_size;
+    /* $Bitmap goes right after $LogFile */
+    ULONGLONG bitmap_lcn = s->logfile_lcn + s->logfile_clusters + s->attrdef_clusters;
+
+    s->next_instance = 0;
+    init_file_record(rec, s->mft_record_size, s->sector_size, 1, FRH_IN_USE, FILE_Bitmap);
+    rec->LinkCount = 1;
+
+    memset(&si, 0, sizeof(si));
+    si.CreationTime = si.ModificationTime = si.MftModificationTime = si.AccessTime = now;
+    si.FileAttributes = FILE_ATTR_HIDDEN | FILE_ATTR_SYSTEM;
+    add_resident_attr(s, rec, AT_STANDARD_INFORMATION, NULL, 0, &si, 72, 0);
+
+    memset(fn_buf, 0, sizeof(fn_buf));
+    WCHAR name[] = { '$', 'B', 'i', 't', 'm', 'a', 'p' };
+    make_file_name(fn, FILE_Root, name, 7,
+                   FILE_ATTR_HIDDEN | FILE_ATTR_SYSTEM,
+                   bitmap_clusters * s->cluster_size,
+                   s->lcn_bitmap_size, now);
+    add_resident_attr(s, rec, AT_FILE_NAME, NULL, 0, fn_buf,
+                      sizeof(FILE_NAME_ATTR) - sizeof(WCHAR) + 7 * sizeof(WCHAR), 0);
+
+    add_nonresident_attr(s, rec, AT_DATA, NULL, 0,
+                         bitmap_lcn, bitmap_clusters,
+                         s->lcn_bitmap_size, s->lcn_bitmap_size);
+
+    /* Mark bitmap clusters as allocated */
+    bitmap_set(s->lcn_bitmap, bitmap_lcn, bitmap_clusters);
+}
+
+/* Build $Boot (record 7) */
+static void build_boot(MKNTFS_STATE *s)
+{
+    FILE_RECORD_HEADER *rec = (FILE_RECORD_HEADER *)(s->mft_buf + 7 * s->mft_record_size);
+    ULONGLONG now = mkntfs_time();
+    STANDARD_INFORMATION si;
+    UCHAR fn_buf[sizeof(FILE_NAME_ATTR) + 8 * sizeof(WCHAR)];
+    FILE_NAME_ATTR *fn = (FILE_NAME_ATTR *)fn_buf;
+    /* $Boot occupies the first cluster(s) - cluster 0 */
+    ULONGLONG boot_clusters = 1;
+    if (s->cluster_size < s->sector_size * 16)
+        boot_clusters = (s->sector_size * 16 + s->cluster_size - 1) / s->cluster_size;
+
+    s->next_instance = 0;
+    init_file_record(rec, s->mft_record_size, s->sector_size, 1, FRH_IN_USE, FILE_Boot);
+    rec->LinkCount = 1;
+
+    memset(&si, 0, sizeof(si));
+    si.CreationTime = si.ModificationTime = si.MftModificationTime = si.AccessTime = now;
+    si.FileAttributes = FILE_ATTR_HIDDEN | FILE_ATTR_SYSTEM;
+    add_resident_attr(s, rec, AT_STANDARD_INFORMATION, NULL, 0, &si, 72, 0);
+
+    memset(fn_buf, 0, sizeof(fn_buf));
+    WCHAR name[] = { '$', 'B', 'o', 'o', 't' };
+    make_file_name(fn, FILE_Root, name, 5,
+                   FILE_ATTR_HIDDEN | FILE_ATTR_SYSTEM,
+                   boot_clusters * s->cluster_size,
+                   boot_clusters * s->cluster_size, now);
+    add_resident_attr(s, rec, AT_FILE_NAME, NULL, 0, fn_buf,
+                      sizeof(FILE_NAME_ATTR) - sizeof(WCHAR) + 5 * sizeof(WCHAR), 0);
+
+    add_nonresident_attr(s, rec, AT_DATA, NULL, 0,
+                         0, boot_clusters,
+                         boot_clusters * s->cluster_size,
+                         boot_clusters * s->cluster_size);
+}
+
+/* Build a simple system file record with just $SI + $FN and empty $DATA */
+static void build_simple_system_file(MKNTFS_STATE *s, ULONG record_num,
+                                      const WCHAR *name, UCHAR name_len,
+                                      USHORT flags)
+{
+    FILE_RECORD_HEADER *rec = (FILE_RECORD_HEADER *)(s->mft_buf + record_num * s->mft_record_size);
+    ULONGLONG now = mkntfs_time();
+    STANDARD_INFORMATION si;
+    UCHAR fn_buf[sizeof(FILE_NAME_ATTR) + 16 * sizeof(WCHAR)];
+    FILE_NAME_ATTR *fn = (FILE_NAME_ATTR *)fn_buf;
+
+    s->next_instance = 0;
+    init_file_record(rec, s->mft_record_size, s->sector_size, 1, flags, record_num);
+    rec->LinkCount = 1;
+
+    memset(&si, 0, sizeof(si));
+    si.CreationTime = si.ModificationTime = si.MftModificationTime = si.AccessTime = now;
+    si.FileAttributes = FILE_ATTR_HIDDEN | FILE_ATTR_SYSTEM;
+    if (flags & FRH_DIRECTORY)
+        si.FileAttributes |= FILE_ATTR_DUP_FILE_NAME_INDEX_PRESENT;
+    add_resident_attr(s, rec, AT_STANDARD_INFORMATION, NULL, 0, &si, 72, 0);
+
+    memset(fn_buf, 0, sizeof(fn_buf));
+    make_file_name(fn, FILE_Root, name, name_len,
+                   si.FileAttributes, 0, 0, now);
+    add_resident_attr(s, rec, AT_FILE_NAME, NULL, 0, fn_buf,
+                      sizeof(FILE_NAME_ATTR) - sizeof(WCHAR) + name_len * sizeof(WCHAR), 0);
+
+    if (flags & FRH_DIRECTORY) {
+        /* Empty $INDEX_ROOT */
+        UCHAR idx_buf[sizeof(INDEX_ROOT) + sizeof(INDEX_ENTRY)];
+        INDEX_ROOT *ir = (INDEX_ROOT *)idx_buf;
+        INDEX_ENTRY *ie;
+
+        memset(idx_buf, 0, sizeof(idx_buf));
+        ir->AttributeType = AT_FILE_NAME;
+        ir->CollationRule = 1;
+        ir->IndexBlockSize = s->index_record_size;
+        ir->ClustersPerIndexBlock = (UCHAR)(s->index_record_size / s->cluster_size);
+        if (ir->ClustersPerIndexBlock == 0) ir->ClustersPerIndexBlock = 1;
+        ir->Header.EntriesOffset = sizeof(INDEX_HEADER);
+        ir->Header.IndexLength = sizeof(INDEX_HEADER) + sizeof(INDEX_ENTRY);
+        ir->Header.AllocatedSize = sizeof(INDEX_HEADER) + sizeof(INDEX_ENTRY);
+
+        ie = (INDEX_ENTRY *)(idx_buf + sizeof(INDEX_ROOT));
+        ie->Length = sizeof(INDEX_ENTRY);
+        ie->Flags = INDEX_ENTRY_END;
+
+        WCHAR i30_name[] = { '$', 'I', '3', '0' };
+        add_resident_attr(s, rec, AT_INDEX_ROOT, i30_name, 4,
+                          idx_buf, sizeof(idx_buf), 0);
+    } else {
+        /* Empty resident $DATA */
+        add_resident_attr(s, rec, AT_DATA, NULL, 0, NULL, 0, 0);
+    }
+}
+
+/* Build $Secure (record 9) with required $SDS, $SDH, $SII */
+static void build_secure(MKNTFS_STATE *s)
+{
+    FILE_RECORD_HEADER *rec = (FILE_RECORD_HEADER *)(s->mft_buf + FILE_Secure * s->mft_record_size);
+    ULONGLONG now = mkntfs_time();
+    STANDARD_INFORMATION si;
+    UCHAR fn_buf[sizeof(FILE_NAME_ATTR) + 8 * sizeof(WCHAR)];
+    FILE_NAME_ATTR *fn = (FILE_NAME_ATTR *)fn_buf;
+
+    s->next_instance = 0;
+    init_file_record(rec, s->mft_record_size, s->sector_size, 1, FRH_IN_USE, FILE_Secure);
+    rec->LinkCount = 1;
+
+    memset(&si, 0, sizeof(si));
+    si.CreationTime = si.ModificationTime = si.MftModificationTime = si.AccessTime = now;
+    si.FileAttributes = FILE_ATTR_HIDDEN | FILE_ATTR_SYSTEM;
+    add_resident_attr(s, rec, AT_STANDARD_INFORMATION, NULL, 0, &si, 72, 0);
+
+    memset(fn_buf, 0, sizeof(fn_buf));
+    WCHAR name[] = { '$', 'S', 'e', 'c', 'u', 'r', 'e' };
+    make_file_name(fn, FILE_Root, name, 7,
+                   FILE_ATTR_HIDDEN | FILE_ATTR_SYSTEM, 0, 0, now);
+    add_resident_attr(s, rec, AT_FILE_NAME, NULL, 0, fn_buf,
+                      sizeof(FILE_NAME_ATTR) - sizeof(WCHAR) + 7 * sizeof(WCHAR), 0);
+
+    /* $SDS named data stream (empty) */
+    WCHAR sds_name[] = { '$', 'S', 'D', 'S' };
+    add_resident_attr(s, rec, AT_DATA, sds_name, 4, NULL, 0, 0);
+
+    /* $SDH index root (Security Descriptor Hash) - empty */
+    UCHAR idx_buf[sizeof(INDEX_ROOT) + sizeof(INDEX_ENTRY)];
+    INDEX_ROOT *ir = (INDEX_ROOT *)idx_buf;
+    INDEX_ENTRY *ie;
+
+    memset(idx_buf, 0, sizeof(idx_buf));
+    ir->AttributeType = 0; /* Not AT_FILE_NAME - this is a view index */
+    ir->CollationRule = 0x12; /* COLLATION_NTOFS_SECURITY_HASH */
+    ir->IndexBlockSize = s->index_record_size;
+    ir->ClustersPerIndexBlock = (UCHAR)(s->index_record_size / s->cluster_size);
+    if (ir->ClustersPerIndexBlock == 0) ir->ClustersPerIndexBlock = 1;
+    ir->Header.EntriesOffset = sizeof(INDEX_HEADER);
+    ir->Header.IndexLength = sizeof(INDEX_HEADER) + sizeof(INDEX_ENTRY);
+    ir->Header.AllocatedSize = sizeof(INDEX_HEADER) + sizeof(INDEX_ENTRY);
+
+    ie = (INDEX_ENTRY *)(idx_buf + sizeof(INDEX_ROOT));
+    ie->Length = sizeof(INDEX_ENTRY);
+    ie->Flags = INDEX_ENTRY_END;
+
+    WCHAR sdh_name[] = { '$', 'S', 'D', 'H' };
+    add_resident_attr(s, rec, AT_INDEX_ROOT, sdh_name, 4,
+                      idx_buf, sizeof(idx_buf), 0);
+
+    /* $SII index root (Security ID Index) - empty */
+    memset(idx_buf, 0, sizeof(idx_buf));
+    ir->AttributeType = 0;
+    ir->CollationRule = 0x10; /* COLLATION_NTOFS_ULONG */
+    ir->IndexBlockSize = s->index_record_size;
+    ir->ClustersPerIndexBlock = (UCHAR)(s->index_record_size / s->cluster_size);
+    if (ir->ClustersPerIndexBlock == 0) ir->ClustersPerIndexBlock = 1;
+    ir->Header.EntriesOffset = sizeof(INDEX_HEADER);
+    ir->Header.IndexLength = sizeof(INDEX_HEADER) + sizeof(INDEX_ENTRY);
+    ir->Header.AllocatedSize = sizeof(INDEX_HEADER) + sizeof(INDEX_ENTRY);
+
+    ie = (INDEX_ENTRY *)(idx_buf + sizeof(INDEX_ROOT));
+    ie->Length = sizeof(INDEX_ENTRY);
+    ie->Flags = INDEX_ENTRY_END;
+
+    WCHAR sii_name[] = { '$', 'S', 'I', 'I' };
+    add_resident_attr(s, rec, AT_INDEX_ROOT, sii_name, 4,
+                      idx_buf, sizeof(idx_buf), 0);
+}
+
+/* Build $UpCase (record 10) */
+static void build_upcase(MKNTFS_STATE *s)
+{
+    FILE_RECORD_HEADER *rec = (FILE_RECORD_HEADER *)(s->mft_buf + 10 * s->mft_record_size);
+    ULONGLONG now = mkntfs_time();
+    STANDARD_INFORMATION si;
+    UCHAR fn_buf[sizeof(FILE_NAME_ATTR) + 8 * sizeof(WCHAR)];
+    FILE_NAME_ATTR *fn = (FILE_NAME_ATTR *)fn_buf;
+    ULONGLONG upcase_bytes = (ULONGLONG)s->upcase_len * sizeof(WCHAR);
+    ULONGLONG upcase_clusters = (upcase_bytes + s->cluster_size - 1) / s->cluster_size;
+    /* Place $UpCase after $Bitmap */
+    ULONGLONG bitmap_clusters = (s->lcn_bitmap_size + s->cluster_size - 1) / s->cluster_size;
+    ULONGLONG upcase_lcn = s->logfile_lcn + s->logfile_clusters + bitmap_clusters;
+
+    s->next_instance = 0;
+    init_file_record(rec, s->mft_record_size, s->sector_size, 1, FRH_IN_USE, FILE_UpCase);
+    rec->LinkCount = 1;
+
+    memset(&si, 0, sizeof(si));
+    si.CreationTime = si.ModificationTime = si.MftModificationTime = si.AccessTime = now;
+    si.FileAttributes = FILE_ATTR_HIDDEN | FILE_ATTR_SYSTEM;
+    add_resident_attr(s, rec, AT_STANDARD_INFORMATION, NULL, 0, &si, 72, 0);
+
+    memset(fn_buf, 0, sizeof(fn_buf));
+    WCHAR name[] = { '$', 'U', 'p', 'C', 'a', 's', 'e' };
+    make_file_name(fn, FILE_Root, name, 7,
+                   FILE_ATTR_HIDDEN | FILE_ATTR_SYSTEM,
+                   upcase_clusters * s->cluster_size, upcase_bytes, now);
+    add_resident_attr(s, rec, AT_FILE_NAME, NULL, 0, fn_buf,
+                      sizeof(FILE_NAME_ATTR) - sizeof(WCHAR) + 7 * sizeof(WCHAR), 0);
+
+    add_nonresident_attr(s, rec, AT_DATA, NULL, 0,
+                         upcase_lcn, upcase_clusters,
+                         upcase_bytes, upcase_bytes);
+
+    bitmap_set(s->lcn_bitmap, upcase_lcn, upcase_clusters);
+}
+
+/* Build records 8-15 (excluding 10 which is UpCase) as simple system files */
+static void build_remaining_system_files(MKNTFS_STATE *s)
+{
+    /* $BadClus (8) */
+    WCHAR n_badclus[] = { '$', 'B', 'a', 'd', 'C', 'l', 'u', 's' };
+    build_simple_system_file(s, FILE_BadClus, n_badclus, 8, FRH_IN_USE);
+
+    /* $Secure (9) - built separately by build_secure() */
+    /* $UpCase (10) - built separately by build_upcase() */
+
+    /* $Extend (11) - directory */
+    WCHAR n_extend[] = { '$', 'E', 'x', 't', 'e', 'n', 'd' };
+    build_simple_system_file(s, FILE_Extend, n_extend, 7, FRH_IN_USE | FRH_DIRECTORY);
+
+    /* Records 12-15: unused but marked with FILE magic */
+    ULONG i;
+    for (i = 12; i < 16; i++) {
+        FILE_RECORD_HEADER *rec = (FILE_RECORD_HEADER *)(s->mft_buf + i * s->mft_record_size);
+        init_file_record(rec, s->mft_record_size, s->sector_size,
+                         (USHORT)(i + 1), 0, i); /* Not in use */
+        /* Write AT_END only */
+        ULONG *end = (ULONG *)((UCHAR *)rec + rec->AttributeOffset);
+        *end = AT_END;
+        rec->BytesInUse = rec->AttributeOffset + 8;
+    }
+}
+
+/* ============================================================
+ * $LogFile initialization
+ * ============================================================ */
+
+/* Write the $LogFile with restart page markers */
+static int write_logfile(MKNTFS_STATE *s)
+{
+    /* $LogFile must be initialized with 0xFF (empty journal) */
+    UCHAR *buf;
+    ULONGLONG offset;
+    ULONG chunk_size = 65536;
+    ULONGLONG remaining;
+    int ret;
+
+    buf = (UCHAR *)malloc(chunk_size);
+    if (!buf) return -1;
+    memset(buf, 0xFF, chunk_size);
+
+    /* Write restart area markers at offset 0 and 0x1000 */
+    /* Simplified: just fill with 0xFF which is "empty log" */
+    offset = s->logfile_lcn * s->cluster_size;
+    remaining = s->logfile_size;
+
+    while (remaining > 0) {
+        ULONG to_write = remaining > chunk_size ? chunk_size : (ULONG)remaining;
+        ret = io_write(s, offset, buf, to_write);
+        if (ret < 0) { free(buf); return -1; }
+        offset += to_write;
+        remaining -= to_write;
+    }
+
+    free(buf);
+    return 0;
+}
+
+/* ============================================================
+ * Main format entry point
+ * ============================================================ */
+
+int mkntfs_format(const MKNTFS_IO *io, const MKNTFS_PARAMS *params)
+{
+    MKNTFS_STATE s;
+    ULONGLONG total_bytes;
+    int ret = -1;
+    ULONG i;
+    ULONGLONG next_lcn;
+
+    memset(&s, 0, sizeof(s));
+    s.io = io;
+
+    /* --- Geometry --- */
+    s.sector_size = params->sector_size ? params->sector_size : 512;
+    s.total_sectors = params->total_sectors;
+    total_bytes = s.total_sectors * s.sector_size;
+
+    s.cluster_size = params->cluster_size ? params->cluster_size : auto_cluster_size(total_bytes);
+    if (s.cluster_size < s.sector_size)
+        s.cluster_size = s.sector_size;
+    s.sectors_per_cluster = s.cluster_size / s.sector_size;
+    s.total_clusters = total_bytes / s.cluster_size;
+
+    s.mft_record_size = params->mft_record_size ? params->mft_record_size : 1024;
+    s.index_record_size = params->index_record_size ? params->index_record_size : 4096;
+
+    s.label = params->label;
+    s.serial_number = params->serial_number;
+    if (s.serial_number == 0) {
+        /* Generate a pseudo-random serial */
+        srand((unsigned)time(NULL));
+        s.serial_number = ((ULONGLONG)rand() << 32) | (ULONGLONG)rand();
+    }
+
+    printf("Formatting NTFS volume:\n");
+    printf("  Sector size:    %u\n", s.sector_size);
+    printf("  Cluster size:   %u\n", s.cluster_size);
+    printf("  Total sectors:  %llu\n", (unsigned long long)s.total_sectors);
+    printf("  Total clusters: %llu\n", (unsigned long long)s.total_clusters);
+
+    /* --- Allocate bitmaps --- */
+    s.lcn_bitmap_size = (ULONG)((s.total_clusters + 7) / 8);
+    s.lcn_bitmap = (UCHAR *)calloc(1, s.lcn_bitmap_size);
+    if (!s.lcn_bitmap) goto cleanup;
+
+    /* MFT: at least 16 records (system files), round up to fill clusters */
+    s.mft_records = 16;
+    s.mft_size = (ULONGLONG)s.mft_records * s.mft_record_size;
+    s.mft_clusters = (s.mft_size + s.cluster_size - 1) / s.cluster_size;
+    s.mft_size = s.mft_clusters * s.cluster_size; /* Round up */
+
+    s.mft_bitmap_size = (s.mft_records + 7) / 8;
+    s.mft_bitmap = (UCHAR *)calloc(1, s.mft_bitmap_size);
+    if (!s.mft_bitmap) goto cleanup;
+
+    /* Mark system file records as used in MFT bitmap */
+    for (i = 0; i < 12; i++)
+        bitmap_set(s.mft_bitmap, i, 1);
+
+    /* --- Layout: Cluster allocation --- */
+    /* Layout order:
+       Cluster 0:          $Boot (boot sector)
+       Cluster 1..N:       Reserved (boot area, typically 8 sectors)
+       Cluster MFT_START:  $MFT
+       Cluster after MFT:  $LogFile
+       Cluster after Log:  $Bitmap
+       Cluster after Bmp:  $UpCase
+       Cluster MIRR_START: $MFTMirr (placed in middle of volume)
+    */
+
+    /* $Boot: cluster 0 */
+    ULONGLONG boot_clusters = 1;
+    if (s.cluster_size < s.sector_size * 16)
+        boot_clusters = (s.sector_size * 16 + s.cluster_size - 1) / s.cluster_size;
+    bitmap_set(s.lcn_bitmap, 0, boot_clusters);
+
+    /* $MFT: starts after boot area */
+    s.mft_lcn = boot_clusters;
+    bitmap_set(s.lcn_bitmap, s.mft_lcn, s.mft_clusters);
+    next_lcn = s.mft_lcn + s.mft_clusters;
+
+    /* $LogFile: 2MB min, 64MB max, ~1/400 of volume */
+    s.logfile_size = total_bytes / 400;
+    if (s.logfile_size < 2 * 1024 * 1024) s.logfile_size = 2 * 1024 * 1024;
+    if (s.logfile_size > 64 * 1024 * 1024) s.logfile_size = 64 * 1024 * 1024;
+    s.logfile_size = ALIGN_UP(s.logfile_size, s.cluster_size);
+    s.logfile_clusters = s.logfile_size / s.cluster_size;
+    s.logfile_lcn = next_lcn;
+    bitmap_set(s.lcn_bitmap, s.logfile_lcn, s.logfile_clusters);
+    next_lcn += s.logfile_clusters;
+
+    /* $AttrDef: placed after $LogFile, before $Bitmap */
+    {
+        ULONG acount;
+        get_attrdef_table(&acount);
+        ULONG attrdef_bytes = acount * sizeof(ATTR_DEF);
+        s.attrdef_clusters = (attrdef_bytes + s.cluster_size - 1) / s.cluster_size;
+        s.attrdef_lcn = next_lcn;
+        /* bitmap_set is done in build_attrdef */
+        next_lcn += s.attrdef_clusters;
+    }
+
+    /* $Bitmap and $UpCase clusters will be set during build_bitmap/build_upcase */
+
+    /* $MFTMirr: place at approximately mid-volume */
+    ULONGLONG mirr_clusters = (4 * s.mft_record_size + s.cluster_size - 1) / s.cluster_size;
+    s.mft_mirr_lcn = s.total_clusters / 2;
+    bitmap_set(s.lcn_bitmap, s.mft_mirr_lcn, mirr_clusters);
+
+    printf("  MFT at cluster:     %llu (%llu clusters)\n",
+           (unsigned long long)s.mft_lcn, (unsigned long long)s.mft_clusters);
+    printf("  LogFile at cluster: %llu (%llu clusters)\n",
+           (unsigned long long)s.logfile_lcn, (unsigned long long)s.logfile_clusters);
+    printf("  MFTMirr at cluster: %llu\n", (unsigned long long)s.mft_mirr_lcn);
+
+    /* --- Allocate MFT buffer --- */
+    s.mft_buf = (UCHAR *)calloc(1, (size_t)s.mft_size);
+    if (!s.mft_buf) goto cleanup;
+
+    /* --- Build upcase table --- */
+    s.upcase_len = 65536;
+    s.upcase = (WCHAR *)calloc(s.upcase_len, sizeof(WCHAR));
+    if (!s.upcase) goto cleanup;
+    ntfs_upcase_table_build(s.upcase, s.upcase_len);
+
+    /* --- Build all MFT records --- */
+    printf("  Building MFT records...\n");
+    build_mft(&s);
+    build_mftmirr(&s);
+    build_logfile(&s);
+    build_volume(&s);
+    build_attrdef(&s);
+    build_root(&s);
+    build_bitmap(&s);
+    build_boot(&s);
+    build_remaining_system_files(&s);
+    build_secure(&s);
+    build_upcase(&s);
+
+    /* --- Apply fixups to all MFT records --- */
+    for (i = 0; i < s.mft_records; i++) {
+        FILE_RECORD_HEADER *rec = (FILE_RECORD_HEADER *)(s.mft_buf + i * s.mft_record_size);
+        if (rec->Magic == NRH_FILE_TYPE)
+            apply_fixup(rec, s.mft_record_size, s.sector_size);
+    }
+
+    /* --- Write boot sector --- */
+    printf("  Writing boot sector...\n");
+    {
+        NTFS_BOOT_SECTOR bs;
+        memset(&bs, 0, sizeof(bs));
+        bs.Jump[0] = 0xEB; bs.Jump[1] = 0x52; bs.Jump[2] = 0x90;
+        memcpy(bs.OemId, "NTFS    ", 8);
+        bs.BytesPerSector = (USHORT)s.sector_size;
+        bs.SectorsPerCluster = (UCHAR)s.sectors_per_cluster;
+        bs.MediaDescriptor = 0xF8; /* Hard disk */
+        bs.SectorsPerTrack = 63;
+        bs.NumberOfHeads = 255;
+        bs.TotalSectors = s.total_sectors - 1; /* Exclude backup boot sector */
+        bs.MftStartLcn = s.mft_lcn;
+        bs.MftMirrStartLcn = s.mft_mirr_lcn;
+        bs.ClustersPerMftRecord = encode_clusters_per_record(s.mft_record_size, s.cluster_size);
+        bs.ClustersPerIndexRecord = encode_clusters_per_record(s.index_record_size, s.cluster_size);
+        bs.SerialNumber = s.serial_number;
+        bs.EndMarker = 0xAA55;
+
+        ret = io_write(&s, 0, &bs, sizeof(bs));
+        if (ret < 0) { fprintf(stderr, "Failed to write boot sector\n"); goto cleanup; }
+
+        /* Write backup boot sector at end of volume */
+        ULONGLONG backup_offset = (s.total_sectors - 1) * s.sector_size;
+        io_write(&s, backup_offset, &bs, sizeof(bs));
+    }
+
+    /* --- Write $LogFile --- */
+    printf("  Writing $LogFile...\n");
+    if (write_logfile(&s) < 0) {
+        fprintf(stderr, "Failed to write $LogFile\n");
+        goto cleanup;
+    }
+
+    /* --- Write MFT records --- */
+    printf("  Writing MFT...\n");
+    {
+        ULONGLONG mft_offset = s.mft_lcn * s.cluster_size;
+        ret = io_write(&s, mft_offset, s.mft_buf, (ULONG)s.mft_size);
+        if (ret < 0) { fprintf(stderr, "Failed to write MFT\n"); goto cleanup; }
+    }
+
+    /* --- Write MFT Mirror (first 4 records) --- */
+    printf("  Writing MFT mirror...\n");
+    {
+        ULONGLONG mirr_offset = s.mft_mirr_lcn * s.cluster_size;
+        ULONG mirr_size = 4 * s.mft_record_size;
+        ret = io_write(&s, mirr_offset, s.mft_buf, mirr_size);
+        if (ret < 0) { fprintf(stderr, "Failed to write MFT mirror\n"); goto cleanup; }
+    }
+
+    /* --- Write $Bitmap --- */
+    printf("  Writing $Bitmap...\n");
+    {
+        ULONGLONG bitmap_clusters = (s.lcn_bitmap_size + s.cluster_size - 1) / s.cluster_size;
+        ULONGLONG bitmap_lcn = s.logfile_lcn + s.logfile_clusters + s.attrdef_clusters;
+        ULONGLONG bitmap_offset = bitmap_lcn * s.cluster_size;
+        /* Write full clusters (zero-padded) */
+        ULONG write_size = (ULONG)(bitmap_clusters * s.cluster_size);
+        UCHAR *bmp_buf = (UCHAR *)calloc(1, write_size);
+        if (!bmp_buf) goto cleanup;
+        memcpy(bmp_buf, s.lcn_bitmap, s.lcn_bitmap_size);
+        ret = io_write(&s, bitmap_offset, bmp_buf, write_size);
+        free(bmp_buf);
+        if (ret < 0) { fprintf(stderr, "Failed to write bitmap\n"); goto cleanup; }
+    }
+
+    /* --- Write $AttrDef --- */
+    printf("  Writing $AttrDef...\n");
+    {
+        ULONG acount;
+        const ATTR_DEF *atable = get_attrdef_table(&acount);
+        ULONG attrdef_bytes = acount * sizeof(ATTR_DEF);
+        ULONGLONG attrdef_offset = s.attrdef_lcn * s.cluster_size;
+        ret = io_write(&s, attrdef_offset, atable, attrdef_bytes);
+        if (ret < 0) { fprintf(stderr, "Failed to write $AttrDef\n"); goto cleanup; }
+    }
+
+    /* --- Write $UpCase --- */
+    printf("  Writing $UpCase...\n");
+    {
+        ULONGLONG bitmap_clusters = (s.lcn_bitmap_size + s.cluster_size - 1) / s.cluster_size;
+        ULONGLONG upcase_lcn = s.logfile_lcn + s.logfile_clusters + bitmap_clusters;
+        ULONGLONG upcase_offset = upcase_lcn * s.cluster_size;
+        ULONG upcase_bytes = s.upcase_len * sizeof(WCHAR);
+        ret = io_write(&s, upcase_offset, s.upcase, upcase_bytes);
+        if (ret < 0) { fprintf(stderr, "Failed to write $UpCase\n"); goto cleanup; }
+    }
+
+    /* --- Flush --- */
+    if (s.io->flush)
+        s.io->flush(s.io->context);
+
+    printf("Format complete.\n");
+    ret = 0;
+
+cleanup:
+    free(s.lcn_bitmap);
+    free(s.mft_bitmap);
+    free(s.mft_buf);
+    free(s.upcase);
+    return ret;
+}
