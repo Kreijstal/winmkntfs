@@ -59,8 +59,7 @@ void ntfs_upcase_table_build(WCHAR *uc, ULONG uc_len)
     /* Greek lowercase -> uppercase (0x03B1-0x03C9 -> 0x0391-0x03A9) */
     for (i = 0x03B1; i <= 0x03C1; i++)
         uc[i] = (WCHAR)(i - 0x20);
-    /* Skip 0x03C2 (final sigma) - maps to 0x03A3 */
-    uc[0x03C2] = 0x03A3;
+    /* 0x03C2 (final sigma) - Windows NTFS keeps as-is (no case mapping) */
     for (i = 0x03C3; i <= 0x03C9; i++)
         uc[i] = (WCHAR)(i - 0x20);
 
@@ -192,15 +191,107 @@ void ntfs_upcase_table_build(WCHAR *uc, ULONG uc_len)
     uc[0x03AD] = 0x0388;
     uc[0x03AE] = 0x0389;
     uc[0x03AF] = 0x038A;
+    uc[0x03CA] = 0x03AA;
+    uc[0x03CB] = 0x03AB;
     uc[0x03CC] = 0x038C;
     uc[0x03CD] = 0x038E;
     uc[0x03CE] = 0x038F;
-    uc[0x03D0] = 0x0392;
-    uc[0x03D1] = 0x0398;
-    uc[0x03D5] = 0x03A6;
-    uc[0x03D6] = 0x03A0;
-    uc[0x03F0] = 0x039A;
-    uc[0x03F1] = 0x03A1;
+    uc[0x03D7] = 0x03CF;
+    for (i = 0x03D9; i <= 0x03EF; i += 2)
+        uc[i] = (WCHAR)(i - 1);
     uc[0x03F2] = 0x03F9;
-    uc[0x03F5] = 0x0395;
+    uc[0x03F8] = 0x03F7;
+    uc[0x03FB] = 0x03FA;
+
+    /* Georgian: no case mapping in Windows NTFS upcase table */
+    /* (0x10D0-0x10F5 was mapped to 0x10A0-0x10C5 above, undo it) */
+    for (i = 0x10D0; i <= 0x10F5; i++)
+        uc[i] = (WCHAR)i;
+
+    /* Latin Extended-B additional */
+    for (i = 0x0247; i <= 0x024F; i += 2)
+        uc[i] = (WCHAR)(i - 1);
+    uc[0x0250] = 0x2C6F;
+    uc[0x0251] = 0x2C6D;
+    uc[0x026B] = 0x2C62;
+    uc[0x0271] = 0x2C6E;
+    uc[0x027D] = 0x2C64;
+    uc[0x0289] = 0x0244;
+    uc[0x028C] = 0x0245;
+
+    /* Greek Extended additional */
+    for (i = 0x0371; i <= 0x0373; i += 2)
+        uc[i] = (WCHAR)(i - 1);
+    uc[0x0377] = 0x0376;
+    for (i = 0x037B; i <= 0x037D; i++)
+        uc[i] = (WCHAR)(i + 0x82);
+
+    /* Cyrillic additional */
+    uc[0x04CF] = 0x04C0;
+    uc[0x04F7] = 0x04F6;
+    for (i = 0x04FB; i <= 0x0523; i += 2)
+        uc[i] = (WCHAR)(i - 1);
+
+    /* Latin Extended Additional */
+    uc[0x1D79] = 0xA77D;
+    uc[0x1D7D] = 0x2C63;
+    for (i = 0x1EFB; i <= 0x1EFF; i += 2)
+        uc[i] = (WCHAR)(i - 1);
+
+    /* Greek Extended additional */
+    uc[0x1F51] = 0x1F59;
+    uc[0x1F53] = 0x1F5B;
+    uc[0x1F55] = 0x1F5D;
+    uc[0x1F57] = 0x1F5F;
+    uc[0x1FB3] = 0x1FBC;
+    uc[0x1FC3] = 0x1FCC;
+    uc[0x1FF3] = 0x1FFC;
+
+    /* Letterlike Symbols / Number Forms */
+    uc[0x214E] = 0x2132;
+    for (i = 0x2170; i <= 0x217F; i++)
+        uc[i] = (WCHAR)(i - 0x10);
+    uc[0x2184] = 0x2183;
+
+    /* Enclosed Alphanumerics */
+    for (i = 0x24D0; i <= 0x24E9; i++)
+        uc[i] = (WCHAR)(i - 0x1A);
+
+    /* Glagolitic */
+    for (i = 0x2C30; i <= 0x2C5E; i++)
+        uc[i] = (WCHAR)(i - 0x30);
+    uc[0x2C61] = 0x2C60;
+    uc[0x2C65] = 0x023A;
+    uc[0x2C66] = 0x023E;
+    for (i = 0x2C68; i <= 0x2C6C; i += 2)
+        uc[i] = (WCHAR)(i - 1);
+    uc[0x2C73] = 0x2C72;
+    uc[0x2C76] = 0x2C75;
+
+    /* Coptic */
+    for (i = 0x2C81; i <= 0x2CE3; i += 2)
+        uc[i] = (WCHAR)(i - 1);
+
+    /* Georgian Supplement (Mkhedruli -> Asomtavruli) */
+    for (i = 0x2D00; i <= 0x2D25; i++)
+        uc[i] = (WCHAR)(i - 0x1C60);
+
+    /* Cyrillic Extended-B */
+    for (i = 0xA641; i <= 0xA65F; i += 2)
+        uc[i] = (WCHAR)(i - 1);
+    for (i = 0xA663; i <= 0xA66D; i += 2)
+        uc[i] = (WCHAR)(i - 1);
+    for (i = 0xA681; i <= 0xA697; i += 2)
+        uc[i] = (WCHAR)(i - 1);
+
+    /* Latin Extended-D */
+    for (i = 0xA723; i <= 0xA72F; i += 2)
+        uc[i] = (WCHAR)(i - 1);
+    for (i = 0xA733; i <= 0xA76F; i += 2)
+        uc[i] = (WCHAR)(i - 1);
+    for (i = 0xA77A; i <= 0xA77C; i += 2)
+        uc[i] = (WCHAR)(i - 1);
+    for (i = 0xA77F; i <= 0xA787; i += 2)
+        uc[i] = (WCHAR)(i - 1);
+    uc[0xA78C] = 0xA78B;
 }

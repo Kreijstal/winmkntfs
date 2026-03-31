@@ -203,7 +203,9 @@ typedef struct _VOLUME_INFORMATION {
 } VOLUME_INFORMATION;
 
 /* Volume flags */
+#ifndef VOLUME_IS_DIRTY
 #define VOLUME_IS_DIRTY         0x0001
+#endif
 #define VOLUME_RESIZE_LOG_FILE  0x0002
 #define VOLUME_UPGRADE_ON_MOUNT 0x0004
 #define VOLUME_MOUNTED_ON_NT4   0x0008

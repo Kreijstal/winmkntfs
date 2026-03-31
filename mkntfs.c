@@ -84,6 +84,9 @@ typedef struct _MKNTFS_STATE {
     /* Attribute instance counter per record */
     USHORT next_instance;
 
+    /* Security ID for current record (set before each build_*) */
+    ULONG current_security_id;
+
     /* Timestamp for all system files (set once) */
     ULONGLONG now;
 
@@ -408,6 +411,7 @@ static void add_si_and_fn(MKNTFS_STATE *s, FILE_RECORD_HEADER *rec,
     memset(&si, 0, sizeof(si));
     si.CreationTime = si.ModificationTime = si.MftModificationTime = si.AccessTime = s->now;
     si.FileAttributes = file_attrs;
+    si.SecurityId = s->current_security_id;
     add_resident_attr(s, rec, AT_STANDARD_INFORMATION, NULL, 0, &si, 72, 0);
 
     memset(fn_buf, 0, sizeof(fn_buf));
@@ -1152,8 +1156,8 @@ int mkntfs_format(const MKNTFS_IO *io, const MKNTFS_PARAMS *params)
     }
 
     printf("Formatting NTFS volume:\n");
-    printf("  Sector size:    %u\n", s.sector_size);
-    printf("  Cluster size:   %u\n", s.cluster_size);
+    printf("  Sector size:    %lu\n", (unsigned long)s.sector_size);
+    printf("  Cluster size:   %lu\n", (unsigned long)s.cluster_size);
     printf("  Total sectors:  %llu\n", (unsigned long long)s.total_sectors);
     printf("  Total clusters: %llu\n", (unsigned long long)s.total_clusters);
 
@@ -1255,6 +1259,7 @@ int mkntfs_format(const MKNTFS_IO *io, const MKNTFS_PARAMS *params)
 
     /* --- Build all MFT records --- */
     printf("  Building MFT records...\n");
+    s.current_security_id = 256; /* Default SD for system files */
     build_mft(&s);
     build_mftmirr(&s);
     build_logfile(&s);
@@ -1264,7 +1269,9 @@ int mkntfs_format(const MKNTFS_IO *io, const MKNTFS_PARAMS *params)
     build_bitmap(&s);
     build_boot(&s);
     build_remaining_system_files(&s);
+    s.current_security_id = 257; /* $Secure gets its own SD */
     build_secure(&s);
+    s.current_security_id = 256;
     build_upcase(&s);
 
     /* --- Apply fixups to all MFT records --- */
